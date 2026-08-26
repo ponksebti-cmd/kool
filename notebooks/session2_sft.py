@@ -145,8 +145,13 @@ class GQAttention(nn.Module):
         k = jnp.repeat(k, n_rep, axis=2)  # [B, T, n_heads, head_dim]
         v = jnp.repeat(v, n_rep, axis=2)
 
-        # Flash attention — never materialises O(seq²) matrix
-        out = jax.nn.dot_product_attention(q, k, v, is_causal=True)  # [B, T, n_heads, head_dim]
+        # Flash attention — requires float32 inputs in JAX 0.11+
+        out = jax.nn.dot_product_attention(
+            q.astype(jnp.float32), 
+            k.astype(jnp.float32), 
+            v.astype(jnp.float32), 
+            is_causal=True
+        ).astype(dtype)  # [B, T, n_heads, head_dim]
         out = out.reshape(B, T, C)
         return nn.Dense(C, use_bias=False, dtype=dtype, name="o_proj")(out)
 

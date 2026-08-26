@@ -182,13 +182,14 @@ class GQAttention(nn.Module):
         k = jnp.repeat(k, n_rep, axis=2)      # [B, T, n_heads, head_dim]
         v = jnp.repeat(v, n_rep, axis=2)      # [B, T, n_heads, head_dim]
 
-        # ── Flash Attention ───────────────────────────────────────────────────
-        # jax.nn.dot_product_attention NEVER materialises the O(seq²) matrix.
-        # On TPU v5e it uses hardware-native tiled attention, using O(seq) HBM.
+        # Flash Attention — requires float32 inputs in JAX 0.11+
+        # Cast up, compute, cast back. Memory is still O(seq) — no giant matrix.
         out = jax.nn.dot_product_attention(
-            q, k, v,
+            q.astype(jnp.float32),
+            k.astype(jnp.float32),
+            v.astype(jnp.float32),
             is_causal=True,
-        )  # [B, T, n_heads, head_dim]
+        ).astype(dtype)  # [B, T, n_heads, head_dim]
 
         out = out.reshape(B, T, C)
         return nn.Dense(C, use_bias=False, dtype=dtype, name="o_proj")(out)
