@@ -30,10 +30,21 @@ print("✓ Dependencies installed")
 # ## 2. Imports & TPU Setup
 
 # %%
-import os, json, time, pickle, shutil, math, threading, queue
+import os, sys, json, time, pickle, shutil, math, threading, queue, argparse
 from functools import partial
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+
+# ── CLI Arguments ─────────────────────────────────────────────────────────────
+# Usage inside Kaggle cell:
+#   !python session1_pretrain.py                    # auto-resume if checkpoint exists
+#   !python session1_pretrain.py --fresh            # wipe checkpoints, start from scratch
+#   !python session1_pretrain.py --checkpoint-dir /kaggle/working/my_ckpts
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--fresh",           action="store_true",  help="Delete existing checkpoints and start from step 0")
+_parser.add_argument("--no-resume",       action="store_true",  help="Don't resume even if a checkpoint exists (but don't delete them)")
+_parser.add_argument("--checkpoint-dir",  type=str, default="/kaggle/working/checkpoints", help="Directory to store checkpoints")
+ARGS, _ = _parser.parse_known_args(sys.argv[1:])
 
 import numpy as np
 import jax
@@ -467,17 +478,26 @@ optimizer = optax.chain(
 # **Saves every 15 minutes. Keeps 3 rolling checkpoints. Atomic writes.**
 
 # %%
-CHECKPOINT_DIR = "/kaggle/working/checkpoints"
+CHECKPOINT_DIR = ARGS.checkpoint_dir
 CHECKPOINT_INTERVAL = 900  # seconds (15 minutes)
 KEEP_N_CHECKPOINTS = 3
 
+if ARGS.fresh:
+    if os.path.exists(CHECKPOINT_DIR):
+        shutil.rmtree(CHECKPOINT_DIR)
+        print(f"[FRESH] ✓ Wiped checkpoint directory: {CHECKPOINT_DIR}")
+    else:
+        print("[FRESH] No existing checkpoints to delete.")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 def _save_pytree(pytree, filepath):
     """Save a JAX/numpy pytree to a .npz file + treedef pickle. Atomic write."""
     leaves, treedef = jax.tree_util.tree_flatten(pytree)
     np_leaves = [np.array(leaf) for leaf in leaves]
-    tmp_path = filepath + ".tmp"
+    # NOTE: numpy appends '.npz' if the filename doesn't already end in '.npz'.
+    # So we must make the tmp path also end in '.npz', NOT '.npz.tmp'.
+    assert filepath.endswith(".npz"), f"Expected .npz filepath, got {filepath}"
+    tmp_path = filepath[:-4] + "_tmp.npz"   # e.g. params_tmp.npz
     np.savez_compressed(tmp_path, *np_leaves)
     # Save treedef alongside
     with open(filepath + "_treedef.pkl", "wb") as f:
@@ -666,6 +686,52 @@ state = TrainState.create(
     tx=optimizer,
 )
 
+start_step = 0
+tokens_trained = 0
+
+def _find_resume_dir():
+    """Prefer /kaggle/working checkpoints; else a mounted notebook-output dataset."""
+    latest = os.path.join(CHECKPOINT_DIR, "latest.txt")
+    if os.path.exists(latest):
+        return CHECKPOINT_DIR
+    input_root = "/kaggle/input"
+    if not os.path.isdir(input_root):
+        return None
+    for name in os.listdir(input_root):
+        path = os.path.join(input_root, name)
+        if os.path.exists(os.path.join(path, "latest.txt")):
+            return path
+    return None
+
+# Check for a checkpoint to resume from (current dir first, then input datasets)
+_can_resume = not ARGS.fresh and not ARGS.no_resume
+resume_dir = _find_resume_dir() if _can_resume else None
+
+# Also check within the current CHECKPOINT_DIR directly
+if _can_resume and resume_dir is None and os.path.exists(os.path.join(CHECKPOINT_DIR, "latest.txt")):
+    resume_dir = CHECKPOINT_DIR
+
+if resume_dir is not None:
+    try:
+        loaded_params, loaded_opt_state, loaded_step, loaded_meta = load_latest_checkpoint(
+            resume_dir, state
+        )
+        state = state.replace(params=loaded_params, opt_state=loaded_opt_state)
+        start_step = loaded_step + 1
+        tokens_trained = int(
+            loaded_meta.get("metrics", {}).get("tokens_trained", loaded_step * TOKENS_PER_STEP)
+        )
+        print(f"✓ Resuming from step {loaded_step} → next step {start_step}")
+    except Exception as e:
+        print(f"[WARN] Failed to load checkpoint ({e}), starting from step 0.")
+else:
+    if ARGS.fresh:
+        print("[FRESH] Starting from step 0.")
+    elif ARGS.no_resume:
+        print("[NO-RESUME] Starting from step 0 (checkpoints preserved).")
+    else:
+        print("No checkpoint found — starting from step 0.")
+
 # Replicate across all 8 TPU devices
 import flax
 state = flax.jax_utils.replicate(state)
@@ -701,8 +767,6 @@ compile_time = time.time() - compile_start
 print(f"✓ Compilation done in {compile_time:.1f}s")
 
 # ── Main training loop ────────────────────────────────────────────────────────
-start_step = 0
-tokens_trained = 0
 total_steps = SESSION1_TOTAL_STEPS
 
 print(f"\n{'='*60}")
