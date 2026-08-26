@@ -189,7 +189,7 @@ class Transformer(nn.Module):
         B, T = input_ids.shape
         embed = self.param("token_embed", nn.initializers.normal(stddev=0.02), (cfg.vocab_size, cfg.d_model))
         x = embed[input_ids].astype(cfg.dtype)
-        RematBlock = nn.remat(TransformerBlock, prevent_cse=False)
+        RematBlock = nn.remat(TransformerBlock, prevent_cse=True)
         for i in range(cfg.n_layers):
             x = RematBlock(cfg, name=f"block_{i}")(x)
         x = RMSNorm(epsilon=cfg.norm_eps, dtype=cfg.dtype, name="final_norm")(x)
@@ -408,7 +408,7 @@ final_pretrain_params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], st
 
 # %%
 SFT_STEPS = 1200
-SFT_BATCH_PER_DEVICE = 8  # Smaller batch for SFT
+SFT_BATCH_PER_DEVICE = 16  # Smaller batch for SFT
 SFT_GLOBAL_BATCH = SFT_BATCH_PER_DEVICE * 8
 
 # SFT Schedule: very short warmup, then flat low LR, then decay

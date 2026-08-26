@@ -263,7 +263,7 @@ class Transformer(nn.Module):
         # Transformer blocks — wrapped with gradient checkpointing (remat)
         # This recomputes activations during backward pass instead of storing them,
         # reducing HBM from ~96G to ~4G at the cost of ~30% more compute.
-        RematBlock = nn.remat(TransformerBlock, prevent_cse=False)
+        RematBlock = nn.remat(TransformerBlock, prevent_cse=True)
         for i in range(cfg.n_layers):
             x = RematBlock(cfg, name=f"block_{i}")(x)
 
@@ -627,7 +627,7 @@ def train_step(state, batch):
 # ## 10. Initialise Model & Training State
 
 # %%
-PER_DEVICE_BATCH = 4     # 4 seqs × 8 chips = 32 global batch
+PER_DEVICE_BATCH = 16    # 16 seqs × 8 chips = 128 global batch
 N_DEVICES = len(jax.devices())
 GLOBAL_BATCH = PER_DEVICE_BATCH * N_DEVICES
 TOKENS_PER_STEP = GLOBAL_BATCH * CFG.max_seq_len
