@@ -259,9 +259,12 @@ class Transformer(nn.Module):
         )
         x = embed[input_ids].astype(cfg.dtype)   # [B, T, d_model]
 
-        # Transformer blocks
+        # Transformer blocks — wrapped with gradient checkpointing (remat)
+        # This recomputes activations during backward pass instead of storing them,
+        # reducing HBM from ~96G to ~4G at the cost of ~30% more compute.
+        RematBlock = nn.remat(TransformerBlock, prevent_cse=False)
         for i in range(cfg.n_layers):
-            x = TransformerBlock(cfg, name=f"block_{i}")(x)
+            x = RematBlock(cfg, name=f"block_{i}")(x)
 
         # Final norm
         x = RMSNorm(epsilon=cfg.norm_eps, dtype=cfg.dtype, name="final_norm")(x)
@@ -623,7 +626,7 @@ def train_step(state, batch):
 # ## 10. Initialise Model & Training State
 
 # %%
-PER_DEVICE_BATCH = 16    # 16 seqs × 8 chips = 128 global batch
+PER_DEVICE_BATCH = 8     # 8 seqs × 8 chips = 64 global batch
 N_DEVICES = len(jax.devices())
 GLOBAL_BATCH = PER_DEVICE_BATCH * N_DEVICES
 TOKENS_PER_STEP = GLOBAL_BATCH * CFG.max_seq_len

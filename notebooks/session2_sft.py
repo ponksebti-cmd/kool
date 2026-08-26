@@ -180,8 +180,9 @@ class Transformer(nn.Module):
         B, T = input_ids.shape
         embed = self.param("token_embed", nn.initializers.normal(stddev=0.02), (cfg.vocab_size, cfg.d_model))
         x = embed[input_ids].astype(cfg.dtype)
+        RematBlock = nn.remat(TransformerBlock, prevent_cse=False)
         for i in range(cfg.n_layers):
-            x = TransformerBlock(cfg, name=f"block_{i}")(x)
+            x = RematBlock(cfg, name=f"block_{i}")(x)
         x = RMSNorm(epsilon=cfg.norm_eps, dtype=cfg.dtype, name="final_norm")(x)
         logits = (x @ embed.T).astype(jnp.float32)
         if cfg.logit_soft_cap > 0:
@@ -364,7 +365,7 @@ pretrain_streams = [
     load_dataset(s["repo"], split=s["split"], streaming=True, trust_remote_code=True)
     for s in PRETRAIN_SOURCES
 ]
-decay_loader = make_batch_loader(pretrain_streams, CFG.max_seq_len, 16, 8)
+decay_loader = make_batch_loader(pretrain_streams, CFG.max_seq_len, 8, 8)
 
 last_decay_log_time = time.time()
 decay_start_time = time.time()
