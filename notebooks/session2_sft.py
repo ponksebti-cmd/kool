@@ -189,9 +189,22 @@ class Transformer(nn.Module):
         B, T = input_ids.shape
         embed = self.param("token_embed", nn.initializers.normal(stddev=0.02), (cfg.vocab_size, cfg.d_model))
         x = embed[input_ids].astype(cfg.dtype)
-        RematBlock = nn.remat(TransformerBlock, prevent_cse=True)
-        for i in range(cfg.n_layers):
-            x = RematBlock(cfg, name=f"block_{i}")(x)
+        class ScannedBlock(nn.Module):
+            config: ModelConfig
+            @nn.compact
+            def __call__(self, carry, _):
+                out = nn.remat(TransformerBlock, prevent_cse=True)(self.config, name="block")(carry)
+                return out, None
+
+        ScanLayers = nn.scan(
+            ScannedBlock,
+            variable_axes={'params': 0},
+            variable_broadcast=False,
+            split_rngs={'params': False},
+            length=cfg.n_layers,
+        )
+        
+        x, _ = ScanLayers(cfg, name="layers")(x, jnp.arange(cfg.n_layers))
         x = RMSNorm(epsilon=cfg.norm_eps, dtype=cfg.dtype, name="final_norm")(x)
         logits = (x @ embed.T).astype(jnp.float32)
         if cfg.logit_soft_cap > 0:

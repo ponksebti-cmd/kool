@@ -260,12 +260,22 @@ class Transformer(nn.Module):
         )
         x = embed[input_ids].astype(cfg.dtype)   # [B, T, d_model]
 
-        # Transformer blocks — wrapped with gradient checkpointing (remat)
-        # This recomputes activations during backward pass instead of storing them,
-        # reducing HBM from ~96G to ~4G at the cost of ~30% more compute.
-        RematBlock = nn.remat(TransformerBlock, prevent_cse=True)
-        for i in range(cfg.n_layers):
-            x = RematBlock(cfg, name=f"block_{i}")(x)
+        class ScannedBlock(nn.Module):
+            config: ModelConfig
+            @nn.compact
+            def __call__(self, carry, _):
+                out = nn.remat(TransformerBlock, prevent_cse=True)(self.config, name="block")(carry)
+                return out, None
+
+        ScanLayers = nn.scan(
+            ScannedBlock,
+            variable_axes={'params': 0},
+            variable_broadcast=False,
+            split_rngs={'params': False},
+            length=cfg.n_layers,
+        )
+        
+        x, _ = ScanLayers(cfg, name="layers")(x, jnp.arange(cfg.n_layers))
 
         # Final norm
         x = RMSNorm(epsilon=cfg.norm_eps, dtype=cfg.dtype, name="final_norm")(x)
