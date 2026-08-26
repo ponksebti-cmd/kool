@@ -1,0 +1,39 @@
+# Core ML / JAX stack
+jax[tpu]>=0.4.26
+flax>=0.8.4
+optax>=0.2.2
+orbax-checkpoint>=0.5.15
+
+# MaxText (install from source after cloning)
+# git clone https://github.com/google/maxtext && pip install -e ./maxtext/
+
+# Data processing
+datasets>=2.19.0
+sentencepiece>=0.2.0
+datatrove[gcs]>=0.3.0
+numpy>=1.26.0
+pyarrow>=16.0.0
+
+# Tokenization / text
+transformers>=4.41.0
+tokenizers>=0.19.0
+
+# GCS / Cloud
+google-cloud-storage>=2.17.0
+
+# Teacher CoT generation
+google-generativeai>=0.7.0   # for Gemini teacher
+openai>=1.30.0               # for OpenAI teacher (optional)
+
+# Evaluation
+lm-eval[api]>=0.4.3          # lm-evaluation-harness
+evaluate>=0.4.2
+sacrebleu>=2.4.2
+torch>=2.3.0                 # for eval only (on CPU VM; not used for training)
+
+# Monitoring / ops
+wandb>=0.17.0
+
+# Dev / utils
+tqdm>=4.66.0
+rich>=13.7.0

@@ -1,0 +1,79 @@
+# ── Identity ─────────────────────────────────────────────────────────────────
+run_name: "lm300m-sft"
+base_output_directory: "gs://<YOUR_BUCKET>/runs/"
+
+# ── Hardware ──────────────────────────────────────────────────────────────────
+hardware: tpu
+tpu_version: v5e
+ici_parallelism: [1, 1, 1, 8]
+dcn_parallelism: [1, 1, 1, 1]
+
+# ── Model — identical architecture as pretrain ────────────────────────────────
+model_name: custom
+decoder_block: llama
+num_decoder_layers: 24
+base_emb_dim: 1024
+num_query_heads: 16
+num_kv_heads: 4
+head_dim: 64
+base_mlp_dim: 2816
+mlp_activations: ["silu", "linear"]
+vocab_size: 32000
+tie_word_embeddings: true
+normalization_layer_epsilon: 1.0e-6
+norm_type: rms_norm
+use_qk_norm: true
+use_rope: true
+rope_max_timescale: 10000
+max_target_length: 2048
+max_prefill_predict_length: 2048
+parallel_attention_ffn: true
+logits_soft_cap: 50.0
+z_loss_weight: 1.0e-5           # lower z-loss weight for fine-tune stability
+
+# ── Load pretrained checkpoint ────────────────────────────────────────────────
+load_parameters_path: "gs://<YOUR_BUCKET>/runs/lm300m-pretrain/checkpoints/final/"
+
+# ── Batching ──────────────────────────────────────────────────────────────────
+per_device_batch_size: 8        # smaller batch for SFT — more gradient updates per token
+remat_policy: full
+
+# ── Precision ─────────────────────────────────────────────────────────────────
+dtype: bfloat16
+
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+optimizer_type: adamw
+adam_b1: 0.9
+adam_b2: 0.95
+adam_eps: 1.0e-8
+weight_decay: 0.05              # lighter decay for fine-tuning
+gradient_clipping: 1.0
+
+# ── Learning Rate — short cosine decay ────────────────────────────────────────
+# Flat low LR with a short warmup then cosine decay to zero.
+learning_rate: 5.0e-5           # ~17x smaller than pretrain peak
+warmup_steps: 50
+steps: 1200                     # ~300M tokens at 128 seqs × 2048 = ~0.6 h
+cosine_learning_rate_final_fraction: 0.1
+
+# ── Loss masking ─────────────────────────────────────────────────────────────
+# Only compute loss on assistant spans. Requires data pipeline to emit a
+# loss_mask tensor (1 = compute loss, 0 = mask). See data/tokenize_and_pack.py.
+use_loss_mask: true
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+save_period: 100
+async_checkpointing: true
+keep_last_n_checkpoints: 3
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+dataset_type: grain
+dataset_path: "gs://<YOUR_BUCKET>/data/sft/packed/"
+tokenizer_path: "gs://<YOUR_BUCKET>/tokenizer/mistral_32k.model"
+add_bos: true
+add_eos: true
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_period: 20
+enable_wandb: true
+metrics_file: "gs://<YOUR_BUCKET>/runs/lm300m-sft/metrics.jsonl"

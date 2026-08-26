@@ -1,0 +1,94 @@
+# ── Identity ─────────────────────────────────────────────────────────────────
+run_name: "lm300m-pretrain"
+base_output_directory: "gs://<YOUR_BUCKET>/runs/"
+
+# ── Hardware ──────────────────────────────────────────────────────────────────
+hardware: tpu
+tpu_version: v5e
+ici_parallelism: [1, 1, 1, 8]   # [pipeline, tensor, fsdp, data] — pure data parallel
+dcn_parallelism: [1, 1, 1, 1]
+
+# ── Model Architecture ────────────────────────────────────────────────────────
+model_name: custom
+decoder_block: llama             # pre-norm + SwiGLU; patched to support parallel attn+FFN
+
+num_decoder_layers: 24
+base_emb_dim: 1024
+num_query_heads: 16
+num_kv_heads: 4                  # GQA: 4 KV groups, 4 Q-heads per group
+head_dim: 64
+base_mlp_dim: 2816               # SwiGLU gate+up each 2816; effective ratio ≈ 2.75x
+mlp_activations: ["silu", "linear"]   # SwiGLU = gate(silu) * linear(up)
+
+vocab_size: 32000
+tie_word_embeddings: true        # weight-tied input/output embeddings
+
+# ── Normalization ─────────────────────────────────────────────────────────────
+normalization_layer_epsilon: 1.0e-6
+norm_type: rms_norm              # RMSNorm, pre-norm placement
+use_qk_norm: true                # QK-Norm on Q and K before dot-product (see patches/)
+
+# ── Positional Encoding ───────────────────────────────────────────────────────
+use_rope: true
+rope_max_timescale: 10000
+max_target_length: 2048
+max_prefill_predict_length: 2048
+
+# ── Parallel Attention + FFN ──────────────────────────────────────────────────
+# Attention and FFN run side-by-side; outputs summed before residual (PaLM-style).
+# Requires the patch in patches/apply_patches.sh.
+parallel_attention_ffn: true
+
+# ── Logit Soft-Capping + Z-Loss ───────────────────────────────────────────────
+logits_soft_cap: 50.0            # tanh-cap: logit → 50·tanh(logit/50)
+z_loss_weight: 1.0e-4            # z_loss = weight × log(Z)²; prevents logit explosion
+
+# ── Sequence & Batching ───────────────────────────────────────────────────────
+per_device_batch_size: 16        # 16 seqs × 2048 tokens × 8 chips = 262,144 tokens/step
+remat_policy: full               # gradient checkpointing — halves activation memory
+
+# ── Precision ─────────────────────────────────────────────────────────────────
+dtype: bfloat16
+logical_axis_rules:
+  - ["batch", "data"]
+  - ["embed", null]
+  - ["heads", null]
+
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+optimizer_type: adamw
+adam_b1: 0.9
+adam_b2: 0.95
+adam_eps: 1.0e-8
+weight_decay: 0.1
+gradient_clipping: 1.0
+
+# ── WSD Learning Rate Schedule ────────────────────────────────────────────────
+# Warmup–Stable–Decay (see schedules/wsd_schedule.py).
+# Decay is triggered by ops/trigger_decay.py at wall-clock hour ~10.5.
+learning_rate: 3.0e-3
+warmup_steps: 2000
+# Stable phase runs until wsd_stable_end_step (overridden at runtime by trigger_decay.py).
+wsd_stable_end_step: 70000      # fallback: triggers decay here if monitor not running
+wsd_decay_steps: 2500
+min_learning_rate: 3.0e-4
+# MaxText will use a custom schedule injected via schedules/wsd_schedule.py.
+# Set cosine_learning_rate_final_fraction to 0 to disable built-in cosine.
+cosine_learning_rate_final_fraction: 0.0
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+save_period: 500                 # every ~4.5 min at target throughput
+async_checkpointing: true        # Orbax async — checkpoint writes off critical path
+keep_last_n_checkpoints: 5       # ~22 min recovery window; ~15 GB GCS storage
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+dataset_type: grain
+dataset_path: "gs://<YOUR_BUCKET>/data/pretrain/packed/"
+tokenizer_path: "gs://<YOUR_BUCKET>/tokenizer/mistral_32k.model"
+add_bos: true
+add_eos: false                   # sequences are packed; EOS acts as document separator
+grain_worker_count: 4
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_period: 50
+enable_wandb: true
+metrics_file: "gs://<YOUR_BUCKET>/runs/lm300m-pretrain/metrics.jsonl"
