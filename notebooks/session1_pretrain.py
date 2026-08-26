@@ -16,11 +16,10 @@
 # %%
 import subprocess, sys
 
-def pip(pkg):
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+def pip(*args):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args], check=True)
 
-pip("flax")
-pip("optax")
+pip("--upgrade", "flax", "optax")
 pip("datasets==2.19.0")
 pip("transformers==4.41.0")
 pip("sentencepiece==0.2.0")
