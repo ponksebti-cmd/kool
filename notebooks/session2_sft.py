@@ -374,8 +374,7 @@ APPROX_PARAMS = 300 * 10**6
 
 for step in range(DECAY_STEPS):
     batch = next(decay_loader)
-    batch_device = jax.device_put_sharded(list(batch), jax.devices())
-    state_decay, metrics = train_step_pretrain(state_decay, batch_device)
+    state_decay, metrics = train_step_pretrain(state_decay, batch)
     tokens_decay_trained += DECAY_TOKENS_PER_STEP
 
     if time.time() - last_decay_log_time >= 20 or step == DECAY_STEPS - 1:
@@ -528,10 +527,8 @@ SFT_TOKENS_PER_STEP = SFT_BATCH_PER_DEVICE * 8 * CFG.max_seq_len
 
 for step in range(SFT_STEPS):
     batch_tok, batch_msk = next(sft_loader)
-    b_tok = jax.device_put_sharded(list(batch_tok), jax.devices())
-    b_msk = jax.device_put_sharded(list(batch_msk), jax.devices())
 
-    state_sft, metrics = train_step_sft(state_sft, b_tok, b_msk)
+    state_sft, metrics = train_step_sft(state_sft, batch_tok, batch_msk)
     tokens_sft_trained += SFT_TOKENS_PER_STEP
 
     if time.time() - last_sft_log_time >= 20 or step == SFT_STEPS - 1:

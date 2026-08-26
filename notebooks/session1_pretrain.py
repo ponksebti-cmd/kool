@@ -681,8 +681,7 @@ print(f"✓ First batch shape: {first_batch.shape}")
 # JIT warmup (compile train_step on first real batch)
 print("Compiling train_step (first step may take 2–5 minutes)...")
 compile_start = time.time()
-batch_device = jax.device_put_sharded(list(first_batch), jax.devices())
-state, metrics = train_step(state, batch_device)
+state, metrics = train_step(state, first_batch)
 jax.block_until_ready(metrics)
 compile_time = time.time() - compile_start
 print(f"✓ Compilation done in {compile_time:.1f}s")
@@ -710,12 +709,11 @@ for step in range(start_step, total_steps):
         print(f"[SESSION] ✓ Stopped at step {step}. Total tokens: {tokens_trained/1e9:.2f}B")
         break
 
-    # Get batch and put on devices
+    # Get batch
     batch_np = next(data_iter)
-    batch_device = jax.device_put_sharded(list(batch_np), jax.devices())
 
     # Train step
-    state, metrics = train_step(state, batch_device)
+    state, metrics = train_step(state, batch_np)
     tokens_trained += TOKENS_PER_STEP
 
     # ── 15-minute checkpoint ──────────────────────────────────────────────────
