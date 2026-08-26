@@ -554,7 +554,7 @@ for step in range(SFT_STEPS):
     state_sft, metrics = train_step_sft(state_sft, batch_tok, batch_msk)
     tokens_sft_trained += SFT_TOKENS_PER_STEP
 
-    if time.time() - last_sft_log_time >= 20 or step == SFT_STEPS - 1:
+    if step % 20 == 0 or step == SFT_STEPS - 1:
         jax.block_until_ready(metrics)
         m = {k: float(jax.device_get(jax.tree_util.tree_map(lambda x: x[0], metrics))[k]) for k in metrics}
         lr = float(sft_schedule(step))
@@ -562,7 +562,6 @@ for step in range(SFT_STEPS):
         tok_per_sec = tokens_sft_trained / elapsed if elapsed > 0 else 0
         tok_per_param = tokens_sft_trained / APPROX_PARAMS
         print(f"SFT Step {step:4d}/{SFT_STEPS} | loss={m['loss']:.4f} | z={m['z_loss']:.2e} | lr={lr:.2e} | {tok_per_sec:,.0f} tok/s | {tok_per_param:.2f} tok/param", flush=True)
-        last_sft_log_time = time.time()
 
 print("✓ SFT phase complete.")
 

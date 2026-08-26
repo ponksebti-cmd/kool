@@ -678,7 +678,7 @@ print("✓ State replicated across 8 TPU chips")
 TRAIN_START_TIME = time.time()
 last_checkpoint_time = TRAIN_START_TIME
 last_log_time = TRAIN_START_TIME
-LOG_INTERVAL = 50       # log every 50 steps
+LOG_INTERVAL = 20       # log and sync every 20 steps
 SESSION_BUDGET_HOURS = 8.75  # stop slightly before Kaggle's 9-hour cutoff
 
 print("Starting data loader...")
@@ -730,21 +730,20 @@ for step in range(start_step, total_steps):
     state, metrics = train_step(state, batch_np)
     tokens_trained += TOKENS_PER_STEP
 
-    # ── 15-minute checkpoint ──────────────────────────────────────────────────
-    time_since_ckpt = time.time() - last_checkpoint_time
-    if time_since_ckpt >= CHECKPOINT_INTERVAL:
-        # Block until current step is done before saving
+    # ── Sync, Log, and Checkpoint (Every LOG_INTERVAL steps) ──────────────────
+    if step % LOG_INTERVAL == 0:
         jax.block_until_ready(metrics)
-        m = {k: float(jax.device_get(jax.tree_util.tree_map(lambda x: x[0], metrics))[k])
-             for k in metrics}
-        m["tokens_trained"] = tokens_trained
-        m["elapsed_hours"] = (time.time() - TRAIN_START_TIME) / 3600
-        save_checkpoint(state, step, m)
-        last_checkpoint_time = time.time()
+        
+        # 1. Checkpoint (Time-based, but checked when synced)
+        if time.time() - last_checkpoint_time >= CHECKPOINT_INTERVAL:
+            m = {k: float(jax.device_get(jax.tree_util.tree_map(lambda x: x[0], metrics))[k])
+                 for k in metrics}
+            m["tokens_trained"] = tokens_trained
+            m["elapsed_hours"] = (time.time() - TRAIN_START_TIME) / 3600
+            save_checkpoint(state, step, m)
+            last_checkpoint_time = time.time()
 
-    # ── Logging ───────────────────────────────────────────────────────────────
-    if time.time() - last_log_time >= 20:
-        jax.block_until_ready(metrics)
+        # 2. Logging
         m = {k: float(jax.device_get(jax.tree_util.tree_map(lambda x: x[0], metrics))[k])
              for k in metrics}
         elapsed = time.time() - TRAIN_START_TIME
