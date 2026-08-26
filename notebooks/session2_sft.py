@@ -330,7 +330,8 @@ state_decay = TrainState.create(
 # Force opt_state to be the loaded one (but step count might mismatch if we reset schedule to 0)
 # To be safe, we just use the loaded opt_state and let the schedule run from step 0 of this session.
 state_decay = state_decay.replace(opt_state=loaded_opt_state, step=0)
-state_decay = jax.device_put_replicated(state_decay, jax.devices())
+import flax
+state_decay = flax.jax_utils.replicate(state_decay)
 
 def compute_loss(logits, input_ids, z_loss_weight=1e-4):
     targets = input_ids[:, 1:]
@@ -420,7 +421,7 @@ state_sft = TrainState.create(
     params=final_pretrain_params,
     tx=sft_optimizer,
 )
-state_sft = jax.device_put_replicated(state_sft, jax.devices())
+state_sft = flax.jax_utils.replicate(state_sft)
 
 
 # ── SFT Data Loader (with loss masking) ───────────────────────────────────────

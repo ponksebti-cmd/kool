@@ -653,7 +653,8 @@ state = TrainState.create(
 )
 
 # Replicate across all 8 TPU devices
-state = jax.device_put_replicated(state, jax.devices())
+import flax
+state = flax.jax_utils.replicate(state)
 print("✓ State replicated across 8 TPU chips")
 
 # %% [markdown]
