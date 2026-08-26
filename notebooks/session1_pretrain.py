@@ -637,7 +637,7 @@ def train_step(state, batch):
 # ## 10. Initialise Model & Training State
 
 # %%
-PER_DEVICE_BATCH = 16    # 16 seqs × 8 chips = 128 global batch
+PER_DEVICE_BATCH = 8     # 8 seqs × 8 chips = 64 global batch
 N_DEVICES = len(jax.devices())
 GLOBAL_BATCH = PER_DEVICE_BATCH * N_DEVICES
 TOKENS_PER_STEP = GLOBAL_BATCH * CFG.max_seq_len

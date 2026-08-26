@@ -421,7 +421,7 @@ final_pretrain_params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], st
 
 # %%
 SFT_STEPS = 1200
-SFT_BATCH_PER_DEVICE = 16  # Smaller batch for SFT
+SFT_BATCH_PER_DEVICE = 8  # Smaller batch for SFT
 SFT_GLOBAL_BATCH = SFT_BATCH_PER_DEVICE * 8
 
 # SFT Schedule: very short warmup, then flat low LR, then decay
