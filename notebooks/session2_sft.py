@@ -102,10 +102,12 @@ def apply_rope(x, cos, sin):
     x_rot_odd  = x1 * sin + x2 * cos
     return jnp.stack([x_rot_even, x_rot_odd], axis=-1).reshape(x.shape)
 
-def _rms_norm_heads(x, scale, eps):
+def _rms_norm_qk(x, scale, eps):
     x_f32 = x.astype(jnp.float32)
     rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + eps)
     return ((x_f32 / rms) * scale).astype(x.dtype)
+
+_rms_norm_heads = _rms_norm_qk  # alias
 
 class GQAttention(nn.Module):
     config: ModelConfig
@@ -115,35 +117,37 @@ class GQAttention(nn.Module):
         B, T, C = x.shape
         dtype = cfg.dtype
 
-        q = nn.Dense(cfg.n_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="q_proj")(x)
+        q = nn.Dense(cfg.n_heads * cfg.head_dim,    use_bias=False, dtype=dtype, name="q_proj")(x)
         k = nn.Dense(cfg.n_kv_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="k_proj")(x)
         v = nn.Dense(cfg.n_kv_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="v_proj")(x)
 
-        q = q.reshape(B, T, cfg.n_heads, cfg.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, cfg.n_kv_heads, cfg.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, cfg.n_kv_heads, cfg.head_dim).transpose(0, 2, 1, 3)
+        # Flash-attention native layout: [B, T, heads, head_dim]
+        q = q.reshape(B, T, cfg.n_heads,    cfg.head_dim)
+        k = k.reshape(B, T, cfg.n_kv_heads, cfg.head_dim)
+        v = v.reshape(B, T, cfg.n_kv_heads, cfg.head_dim)
 
         if cfg.use_qk_norm:
-            q_scale = self.param("q_norm_scale", nn.initializers.ones, (cfg.n_heads, 1, cfg.head_dim))
-            k_scale = self.param("k_norm_scale", nn.initializers.ones, (cfg.n_kv_heads, 1, cfg.head_dim))
-            q = _rms_norm_heads(q, q_scale, cfg.norm_eps)
-            k = _rms_norm_heads(k, k_scale, cfg.norm_eps)
+            q_scale = self.param("q_norm_scale", nn.initializers.ones, (cfg.n_heads, cfg.head_dim))
+            k_scale = self.param("k_norm_scale", nn.initializers.ones, (cfg.n_kv_heads, cfg.head_dim))
+            q = _rms_norm_qk(q, q_scale, cfg.norm_eps)
+            k = _rms_norm_qk(k, k_scale, cfg.norm_eps)
 
-        q = apply_rope(q, ROPE_COS[:T], ROPE_SIN[:T])
-        k = apply_rope(k, ROPE_COS[:T], ROPE_SIN[:T])
+        # RoPE in [B, heads, T, head_dim], then back
+        q_h = q.transpose(0, 2, 1, 3)
+        k_h = k.transpose(0, 2, 1, 3)
+        q_h = apply_rope(q_h, ROPE_COS[:T], ROPE_SIN[:T])
+        k_h = apply_rope(k_h, ROPE_COS[:T], ROPE_SIN[:T])
+        q = q_h.transpose(0, 2, 1, 3)
+        k = k_h.transpose(0, 2, 1, 3)
 
+        # GQA expand
         n_rep = cfg.n_heads // cfg.n_kv_heads
-        k = jnp.repeat(k, n_rep, axis=1)
-        v = jnp.repeat(v, n_rep, axis=1)
+        k = jnp.repeat(k, n_rep, axis=2)  # [B, T, n_heads, head_dim]
+        v = jnp.repeat(v, n_rep, axis=2)
 
-        scale = cfg.head_dim ** -0.5
-        attn = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
-        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        attn = jnp.where(causal[None, None, :, :], attn, jnp.finfo(dtype).min)
-        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(dtype)
-
-        out = jnp.einsum("bhij,bhjd->bhid", attn, v)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
+        # Flash attention — never materialises O(seq²) matrix
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=True)  # [B, T, n_heads, head_dim]
+        out = out.reshape(B, T, C)
         return nn.Dense(C, use_bias=False, dtype=dtype, name="o_proj")(out)
 
 class SwiGLUFFN(nn.Module):

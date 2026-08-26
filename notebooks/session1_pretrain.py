@@ -153,55 +153,55 @@ class GQAttention(nn.Module):
         dtype = cfg.dtype
 
         # Projections
-        q = nn.Dense(cfg.n_heads * cfg.head_dim,     use_bias=False, dtype=dtype, name="q_proj")(x)
-        k = nn.Dense(cfg.n_kv_heads * cfg.head_dim,  use_bias=False, dtype=dtype, name="k_proj")(x)
-        v = nn.Dense(cfg.n_kv_heads * cfg.head_dim,  use_bias=False, dtype=dtype, name="v_proj")(x)
+        q = nn.Dense(cfg.n_heads * cfg.head_dim,    use_bias=False, dtype=dtype, name="q_proj")(x)
+        k = nn.Dense(cfg.n_kv_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="k_proj")(x)
+        v = nn.Dense(cfg.n_kv_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="v_proj")(x)
 
-        # Reshape: [B, T, heads, head_dim] → [B, heads, T, head_dim]
-        q = q.reshape(B, T, cfg.n_heads, cfg.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, cfg.n_kv_heads, cfg.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, cfg.n_kv_heads, cfg.head_dim).transpose(0, 2, 1, 3)
+        # Reshape to [B, T, heads, head_dim]  (flash-attention native layout)
+        q = q.reshape(B, T, cfg.n_heads,    cfg.head_dim)
+        k = k.reshape(B, T, cfg.n_kv_heads, cfg.head_dim)
+        v = v.reshape(B, T, cfg.n_kv_heads, cfg.head_dim)
 
-        # QK-Norm (normalize before RoPE and dot product)
+        # QK-Norm — applied along head_dim axis
         if cfg.use_qk_norm:
-            q_scale = self.param("q_norm_scale", nn.initializers.ones,
-                                 (cfg.n_heads, 1, cfg.head_dim))
-            k_scale = self.param("k_norm_scale", nn.initializers.ones,
-                                 (cfg.n_kv_heads, 1, cfg.head_dim))
-            q = _rms_norm_heads(q, q_scale, cfg.norm_eps)
-            k = _rms_norm_heads(k, k_scale, cfg.norm_eps)
+            q_scale = self.param("q_norm_scale", nn.initializers.ones, (cfg.n_heads, cfg.head_dim))
+            k_scale = self.param("k_norm_scale", nn.initializers.ones, (cfg.n_kv_heads, cfg.head_dim))
+            q = _rms_norm_qk(q, q_scale, cfg.norm_eps)  # [B, T, n_heads, head_dim]
+            k = _rms_norm_qk(k, k_scale, cfg.norm_eps)  # [B, T, n_kv_heads, head_dim]
 
-        # RoPE
-        cos = ROPE_COS[:T]
-        sin = ROPE_SIN[:T]
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        # RoPE — apply in [B, heads, T, head_dim] layout, then transpose back
+        q_h = q.transpose(0, 2, 1, 3)  # [B, n_heads, T, head_dim]
+        k_h = k.transpose(0, 2, 1, 3)  # [B, n_kv_heads, T, head_dim]
+        q_h = apply_rope(q_h, ROPE_COS[:T], ROPE_SIN[:T])
+        k_h = apply_rope(k_h, ROPE_COS[:T], ROPE_SIN[:T])
+        q = q_h.transpose(0, 2, 1, 3)  # back to [B, T, n_heads, head_dim]
+        k = k_h.transpose(0, 2, 1, 3)  # back to [B, T, n_kv_heads, head_dim]
 
-        # Repeat K,V to match Q head count (GQA expansion)
-        n_rep = cfg.n_heads // cfg.n_kv_heads   # = 4
-        k = jnp.repeat(k, n_rep, axis=1)        # [B, n_heads, T, head_dim]
-        v = jnp.repeat(v, n_rep, axis=1)
+        # GQA: repeat K/V to match Q head count
+        n_rep = cfg.n_heads // cfg.n_kv_heads  # = 4
+        k = jnp.repeat(k, n_rep, axis=2)      # [B, T, n_heads, head_dim]
+        v = jnp.repeat(v, n_rep, axis=2)      # [B, T, n_heads, head_dim]
 
-        # Scaled dot-product attention
-        scale = cfg.head_dim ** -0.5
-        attn = jnp.einsum("bhid,bhjd->bhij", q, k) * scale  # [B, heads, T, T]
+        # ── Flash Attention ───────────────────────────────────────────────────
+        # jax.nn.dot_product_attention NEVER materialises the O(seq²) matrix.
+        # On TPU v5e it uses hardware-native tiled attention, using O(seq) HBM.
+        out = jax.nn.dot_product_attention(
+            q, k, v,
+            is_causal=True,
+        )  # [B, T, n_heads, head_dim]
 
-        # Causal mask
-        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        attn = jnp.where(causal[None, None, :, :], attn, jnp.finfo(dtype).min)
-        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(dtype)
+        out = out.reshape(B, T, C)
+        return nn.Dense(C, use_bias=False, dtype=dtype, name="o_proj")(out)
 
-        # Attend and project
-        out = jnp.einsum("bhij,bhjd->bhid", attn, v)          # [B, heads, T, head_dim]
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)      # [B, T, C]
-        out = nn.Dense(C, use_bias=False, dtype=dtype, name="o_proj")(out)
-        return out
 
-def _rms_norm_heads(x, scale, eps):
-    """Per-head RMS normalization. x: [B, heads, T, head_dim]"""
+def _rms_norm_qk(x, scale, eps):
+    """RMS norm for [B, T, heads, head_dim] tensors."""
     x_f32 = x.astype(jnp.float32)
     rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + eps)
     return ((x_f32 / rms) * scale).astype(x.dtype)
+
+# Keep old name as alias for any other references
+_rms_norm_heads = _rms_norm_qk
 
 
 # ── SwiGLU FFN ────────────────────────────────────────────────────────────────
@@ -626,7 +626,7 @@ def train_step(state, batch):
 # ## 10. Initialise Model & Training State
 
 # %%
-PER_DEVICE_BATCH = 8     # 8 seqs × 8 chips = 64 global batch
+PER_DEVICE_BATCH = 4     # 4 seqs × 8 chips = 32 global batch
 N_DEVICES = len(jax.devices())
 GLOBAL_BATCH = PER_DEVICE_BATCH * N_DEVICES
 TOKENS_PER_STEP = GLOBAL_BATCH * CFG.max_seq_len
