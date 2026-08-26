@@ -23,6 +23,7 @@ pip("--upgrade", "flax", "optax")
 pip("datasets==2.19.0")
 pip("transformers==4.41.0")
 pip("sentencepiece==0.2.0")
+pip("huggingface_hub>=0.23.0")
 
 print("✓ Dependencies installed")
 
@@ -44,7 +45,30 @@ _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--fresh",           action="store_true",  help="Delete existing checkpoints and start from step 0")
 _parser.add_argument("--no-resume",       action="store_true",  help="Don't resume even if a checkpoint exists (but don't delete them)")
 _parser.add_argument("--checkpoint-dir",  type=str, default="/kaggle/working/checkpoints", help="Directory to store checkpoints")
+_parser.add_argument("--hf-repo",         type=str, default="",  help="HuggingFace repo id for checkpoint backup, e.g. 'yourname/archimedes-ckpts'")
 ARGS, _ = _parser.parse_known_args(sys.argv[1:])
+
+# ── Hugging Face Hub backup (optional but strongly recommended) ────────────────
+# 1. Go to huggingface.co → Settings → Access Tokens → New token (write)
+# 2. In Kaggle: Add-ons → Secrets → Add secret named HF_TOKEN
+# 3. Run with: !python session1_pretrain.py --hf-repo yourname/archimedes-ckpts
+try:
+    from kaggle_secrets import UserSecretsClient
+    HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
+    print("✓ HF_TOKEN loaded from Kaggle secrets")
+except Exception:
+    HF_TOKEN = os.environ.get("HF_TOKEN", "")
+    if HF_TOKEN:
+        print("✓ HF_TOKEN loaded from environment")
+
+HF_REPO_ID = ARGS.hf_repo.strip()
+if HF_REPO_ID and HF_TOKEN:
+    print(f"✓ HF Hub backup enabled → {HF_REPO_ID}")
+elif HF_REPO_ID and not HF_TOKEN:
+    print("⚠ --hf-repo set but HF_TOKEN not found. Backup disabled.")
+    HF_REPO_ID = ""
+else:
+    print("ℹ HF Hub backup disabled (pass --hf-repo to enable)")
 
 import numpy as np
 import jax
@@ -396,36 +420,45 @@ def greedy_pack_generator(ds_streams, weights, tokenizer, seq_len, eos_id):
             buffer = buffer[seq_len:]
 
 
-def make_batch_loader(seq_len, per_device_batch, n_devices, queue_maxsize=8):
+def make_batch_loader(seq_len, per_device_batch, n_devices, n_workers=4, queue_maxsize=32):
     """
     Returns an iterator that yields [n_devices, per_device_batch, seq_len] int32 arrays.
-    Runs the data generator in a background thread.
+    Uses multiple parallel tokenizer threads feeding one shared queue for higher throughput.
     """
     global_batch = n_devices * per_device_batch
 
     print("Initialising dataset streams...")
     streams = [make_dataset_stream(s) for s in PRETRAIN_SOURCES]
     weights = [s["weight"] for s in PRETRAIN_SOURCES]
-    gen = greedy_pack_generator(streams, weights, tokenizer, seq_len, EOS_ID)
     print("✓ Streams ready")
 
-    q = queue.Queue(maxsize=queue_maxsize)
+    # Each worker gets its own independent stream + generator
+    seq_q = queue.Queue(maxsize=queue_maxsize * global_batch)  # pool of packed sequences
+    batch_q = queue.Queue(maxsize=queue_maxsize)               # pool of ready batches
 
-    def fill():
-        batch_seqs = []
+    def worker():
+        """Independent tokenizer thread — pulls text, packs into seq_len chunks."""
+        gen = greedy_pack_generator(streams, weights, tokenizer, seq_len, EOS_ID)
         for seq in gen:
+            seq_q.put(seq)
+
+    def batcher():
+        """Assembles sequences from the pool into full batches."""
+        batch_seqs = []
+        while True:
+            seq = seq_q.get()
             batch_seqs.append(seq)
             if len(batch_seqs) == global_batch:
-                arr = np.stack(batch_seqs, axis=0)          # [global_batch, seq_len]
-                arr = arr.reshape(n_devices, per_device_batch, seq_len)
-                q.put(arr)
+                arr = np.stack(batch_seqs).reshape(n_devices, per_device_batch, seq_len)
+                batch_q.put(arr)
                 batch_seqs = []
 
-    t = threading.Thread(target=fill, daemon=True)
-    t.start()
+    for _ in range(n_workers):
+        threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=batcher, daemon=True).start()
 
     while True:
-        yield q.get()
+        yield batch_q.get()
 
 # %% [markdown]
 # ## 7. WSD Learning Rate Schedule
@@ -557,10 +590,40 @@ def save_checkpoint(state, step, metrics: dict):
     os.replace(latest_tmp, os.path.join(CHECKPOINT_DIR, "latest.txt"))
 
     elapsed_save = time.time() - t0
-    print(f"[CKPT] ✓ Saved in {elapsed_save:.1f}s → {ckpt_path}", flush=True)
+    print(f"[CKPT] ✓ Saved locally in {elapsed_save:.1f}s → {ckpt_path}", flush=True)
 
     # Cleanup old checkpoints
     _cleanup_old_checkpoints(step)
+
+    # ── Upload params.npz to Hugging Face Hub in background (non-blocking) ─────────
+    if HF_REPO_ID:
+        params_path = os.path.join(ckpt_path, "params.npz")
+        meta_path_up = os.path.join(ckpt_path, "meta.json")
+        def _hf_upload(local_params, local_meta, s):
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=HF_TOKEN)
+                api.create_repo(HF_REPO_ID, repo_type="model", exist_ok=True, private=True)
+                remote_dir = f"step_{s:07d}"
+                api.upload_file(path_or_fileobj=local_params,
+                                path_in_repo=f"{remote_dir}/params.npz",
+                                repo_id=HF_REPO_ID, repo_type="model")
+                api.upload_file(path_or_fileobj=local_meta,
+                                path_in_repo=f"{remote_dir}/meta.json",
+                                repo_id=HF_REPO_ID, repo_type="model")
+                # Also write a latest.txt so we can find it on resume
+                import io
+                api.upload_file(path_or_fileobj=io.BytesIO(f"step_{s:07d}".encode()),
+                                path_in_repo="latest.txt",
+                                repo_id=HF_REPO_ID, repo_type="model")
+                print(f"[HF] ✓ Uploaded step {s} to {HF_REPO_ID}", flush=True)
+            except Exception as e:
+                print(f"[HF] ⚠ Upload failed (training continues): {e}", flush=True)
+        threading.Thread(
+            target=_hf_upload,
+            args=(params_path, meta_path_up, step),
+            daemon=True,
+        ).start()
 
     return ckpt_path
 
