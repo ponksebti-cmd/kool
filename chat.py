@@ -201,11 +201,11 @@ def chat():
         print("Error: You must provide either --ckpt or --hf-repo")
         return
 
-    # Load tokenizer
-    if not os.path.exists(args.tokenizer):
-        print(f"Error: Tokenizer not found at {args.tokenizer}")
-        return
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
+    # Load tokenizer via Hugging Face (matches pretrain script)
+    from transformers import AutoTokenizer
+    print("Loading Mistral tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=False)
+    eos_id = 2 # Mistral EOS
 
     # Resolve Checkpoint Path
     ckpt_path = args.ckpt
@@ -243,7 +243,7 @@ def chat():
     if args.prompt:
         print(f"\nPrompt: {args.prompt}")
         prompt = f"<|user|>{args.prompt}<|end|>\n<|assistant|>"
-        tokens = sp.encode(prompt, add_special_tokens=False)
+        tokens = tokenizer.encode(prompt, add_special_tokens=False)
         print("Assistant: ", end="", flush=True)
         
         generated_tokens = []
@@ -254,12 +254,12 @@ def chat():
             key, subkey = jax.random.split(key)
             next_token = int(sample_top_k(next_token_logits, k=40, key=subkey))
             
-            if next_token == sp.eos_token_id or next_token == 2:
+            if next_token == eos_id or next_token == tokenizer.eos_token_id:
                 break
                 
             generated_tokens.append(next_token)
             tokens.append(next_token)
-            print(sp.decode([next_token]), end="", flush=True)
+            print(tokenizer.decode([next_token]), end="", flush=True)
         print("\n")
         return
 
@@ -286,7 +286,7 @@ def chat():
             prompt += f"<|{msg['role']}|>{msg['content']}<|end|>\n"
         prompt += "<|assistant|>"
         
-        tokens = sp.encode(prompt, add_special_tokens=False)
+        tokens = tokenizer.encode(prompt, add_special_tokens=False)
         print("Assistant: ", end="", flush=True)
         
         generated_tokens = []
@@ -300,17 +300,17 @@ def chat():
             key, subkey = jax.random.split(key)
             next_token = int(sample_top_k(next_token_logits, k=40, key=subkey))
             
-            if next_token == sp.eos_token_id or next_token == 2: # Mistral EOS
+            if next_token == eos_id or next_token == tokenizer.eos_token_id:
                 break
                 
             generated_tokens.append(next_token)
             tokens.append(next_token)
             
-            word = sp.decode([next_token])
+            word = tokenizer.decode([next_token])
             print(word, end="", flush=True)
             
         print()
-        history.append({"role": "assistant", "content": sp.decode(generated_tokens)})
+        history.append({"role": "assistant", "content": tokenizer.decode(generated_tokens)})
 
 if __name__ == "__main__":
     chat()
