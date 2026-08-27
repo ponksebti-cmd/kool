@@ -194,6 +194,7 @@ def chat():
     parser.add_argument("--tokenizer", type=str, default="notebooks/tokenizer.model")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_gen", type=int, default=500)
+    parser.add_argument("--prompt", type=str, default="", help="If provided, run in single-shot mode instead of interactive loop (perfect for Kaggle cells)")
     args = parser.parse_args()
 
     if not args.ckpt and not args.hf_repo:
@@ -236,14 +237,39 @@ def chat():
     # Ensure eager mode to prevent recompiling for every sequence length
     jax.config.update('jax_disable_jit', True)
 
+    key = jax.random.PRNGKey(42)
+
+    # ── SINGLE-SHOT MODE (For Kaggle / Non-interactive) ──
+    if args.prompt:
+        print(f"\nPrompt: {args.prompt}")
+        prompt = f"<|user|>{args.prompt}<|end|>\n<|assistant|>"
+        tokens = sp.encode(prompt, add_special_tokens=False)
+        print("Assistant: ", end="", flush=True)
+        
+        generated_tokens = []
+        for _ in range(args.max_gen):
+            input_ids = jnp.array([tokens], dtype=jnp.int32)
+            logits = model.apply({"params": params}, input_ids)
+            next_token_logits = logits[0, -1, :] / args.temperature
+            key, subkey = jax.random.split(key)
+            next_token = int(sample_top_k(next_token_logits, k=40, key=subkey))
+            
+            if next_token == sp.eos_token_id or next_token == 2:
+                break
+                
+            generated_tokens.append(next_token)
+            tokens.append(next_token)
+            print(sp.decode([next_token]), end="", flush=True)
+        print("\n")
+        return
+
+    # ── INTERACTIVE MODE (For Local Mac / Terminal) ──
     print("\n" + "="*50)
     print(" 🚀 Archimedes Chat Ready!")
     print(" Type 'quit' to exit.")
     print("="*50 + "\n")
 
-    key = jax.random.PRNGKey(42)
     history = []
-
     while True:
         try:
             user_input = input("\nYou: ")
