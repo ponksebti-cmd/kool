@@ -29,6 +29,7 @@ class ModelConfig:
     logit_soft_cap:  float = 50.0     # tanh soft-cap on output logits
     z_loss_weight:   float = 1e-4     # auxiliary z-loss
     use_qk_norm:     bool  = True     # normalize Q and K before dot product
+    parallel_attn_ffn: bool = True    # PaLM-style parallel blocks
     dtype: jnp.dtype = jnp.bfloat16
 
 CFG = ModelConfig()
@@ -146,10 +147,15 @@ class TransformerBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         normed = RMSNorm(epsilon=self.config.norm_eps, dtype=self.config.dtype, name="pre_norm")(x)
-        x = x + GQAttention(self.config, name="attention")(normed)
-        x = x + SwiGLUFFN(self.config, name="ffn")(
-            RMSNorm(epsilon=self.config.norm_eps, dtype=self.config.dtype, name="post_attn_norm")(x)
-        )
+        if self.config.parallel_attn_ffn:
+            attn_out = GQAttention(self.config, name="attention")(normed)
+            ffn_out  = SwiGLUFFN(self.config, name="ffn")(normed)
+            x = x + attn_out + ffn_out
+        else:
+            x = x + GQAttention(self.config, name="attention")(normed)
+            x = x + SwiGLUFFN(self.config, name="ffn")(
+                RMSNorm(epsilon=self.config.norm_eps, dtype=self.config.dtype, name="post_attn_norm")(x)
+            )
         return x
 
 
