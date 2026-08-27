@@ -170,19 +170,16 @@ def load_checkpoint(filepath):
     with np.load(filepath, allow_pickle=False) as data:
         np_leaves = [data[f"arr_{i}"] for i in range(len(data.files))]
     
-    # We must construct a dummy model to get the exact treedef to restore it
     dummy_model = Transformer(CFG)
     dummy_input = jnp.zeros((1, 1), dtype=jnp.int32)
     print("Initialising dummy model for tree structure...")
     dummy_params = dummy_model.init(jax.random.PRNGKey(0), dummy_input)["params"]
     treedef = jax.tree_util.tree_structure(dummy_params)
     
-    # Pack the flat arrays back into the PyTree
     params = jax.tree_util.tree_unflatten(treedef, np_leaves)
     return params
 
 def sample_top_k(logits, k, key):
-    # Keep only top k
     vals, _ = jax.lax.top_k(logits, k)
     min_val = vals[..., -1, None]
     logits = jnp.where(logits < min_val, -1e10, logits)
@@ -191,11 +188,17 @@ def sample_top_k(logits, k, key):
 # 3. Chat Loop
 def chat():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint .npz file")
+    parser.add_argument("--ckpt", type=str, default="", help="Path to local checkpoint .npz file")
+    parser.add_argument("--hf-repo", type=str, default="", help="Hugging Face repo to pull latest checkpoint from (e.g. sebtiwho/archimedes-ckpts)")
+    parser.add_argument("--hf-token", type=str, default="", help="HF Token if repo is private")
     parser.add_argument("--tokenizer", type=str, default="notebooks/tokenizer.model")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_gen", type=int, default=500)
     args = parser.parse_args()
+
+    if not args.ckpt and not args.hf_repo:
+        print("Error: You must provide either --ckpt or --hf-repo")
+        return
 
     # Load tokenizer
     if not os.path.exists(args.tokenizer):
@@ -203,8 +206,31 @@ def chat():
         return
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
 
+    # Resolve Checkpoint Path
+    ckpt_path = args.ckpt
+    if args.hf_repo:
+        from huggingface_hub import hf_hub_download, list_repo_files
+        print(f"Checking Hugging Face Hub for {args.hf_repo}...")
+        try:
+            token = args.hf_token or os.environ.get("HF_TOKEN")
+            # Get latest.txt
+            latest_txt = hf_hub_download(repo_id=args.hf_repo, filename="latest.txt", token=token)
+            with open(latest_txt, "r") as f:
+                latest_step_dir = f.read().strip()
+            print(f"Found latest step: {latest_step_dir}")
+            
+            # Download params.npz
+            ckpt_path = hf_hub_download(
+                repo_id=args.hf_repo, 
+                filename=f"{latest_step_dir}/params.npz", 
+                token=token
+            )
+        except Exception as e:
+            print(f"Failed to pull from Hugging Face: {e}")
+            return
+
     # Load Model
-    params = load_checkpoint(args.ckpt)
+    params = load_checkpoint(ckpt_path)
     model = Transformer(CFG)
     
     # Ensure eager mode to prevent recompiling for every sequence length
