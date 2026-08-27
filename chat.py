@@ -14,35 +14,43 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 # 1. Model Definition (Copied from session1_pretrain.py to keep chat.py standalone)
 @dataclass
 class ModelConfig:
-    d_model: int = 1024
-    n_layers: int = 24
-    n_heads: int = 16
-    n_kv_heads: int = 8
-    vocab_size: int = 32000
-    norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-    head_dim: int = 64
-    ffn_dim: int = 4096
-    max_seq_len: int = 2048
-    parallel_attn_ffn: bool = False
-    use_qk_norm: bool = False
-    logit_soft_cap: float = 0.0
+    # Architecture (locked — do not change)
+    vocab_size:      int   = 32000
+    n_layers:        int   = 24
+    d_model:         int   = 1024
+    n_heads:         int   = 16       # query heads
+    n_kv_heads:      int   = 4        # key/value heads (GQA)
+    head_dim:        int   = 64       # d_model / n_heads
+    ffn_dim:         int   = 2816     # SwiGLU intermediate
+    max_seq_len:     int   = 2048
+    rope_base:       float = 10000.0
+    norm_eps:        float = 1e-6
+    # Stability upgrades
+    logit_soft_cap:  float = 50.0     # tanh soft-cap on output logits
+    z_loss_weight:   float = 1e-4     # auxiliary z-loss
+    use_qk_norm:     bool  = True     # normalize Q and K before dot product
     dtype: jnp.dtype = jnp.bfloat16
 
 CFG = ModelConfig()
 
+# ── Model Components ──────────────────────────────────────────────────────────
+
 class RMSNorm(nn.Module):
-    epsilon: float = 1e-5
+    epsilon: float = 1e-6
     dtype: jnp.dtype = jnp.bfloat16
+
     @nn.compact
     def __call__(self, x):
+        # Always compute norm in float32 for stability
         x_f32 = x.astype(jnp.float32)
         rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + self.epsilon)
         normed = (x_f32 / rms).astype(self.dtype)
         scale = self.param("scale", nn.initializers.ones, (x.shape[-1],))
         return normed * scale
 
+
 def apply_rope(xq, freqs_cos, freqs_sin):
+    # Match layouts
     xq_f32 = xq.astype(jnp.float32)
     x1, x2 = xq_f32[..., 0::2], xq_f32[..., 1::2]
     xq_rot_even = x1 * freqs_cos - x2 * freqs_sin
@@ -50,52 +58,64 @@ def apply_rope(xq, freqs_cos, freqs_sin):
     xq_out = jnp.stack([xq_rot_even, xq_rot_odd], axis=-1).reshape(xq.shape)
     return xq_out.astype(xq.dtype)
 
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].astype(np.float32) / dim))
     t = np.arange(end, dtype=np.float32)
     freqs = np.outer(t, freqs)
     return jnp.array(np.cos(freqs)), jnp.array(np.sin(freqs))
 
-ROPE_COS, ROPE_SIN = precompute_freqs_cis(CFG.head_dim, CFG.max_seq_len, CFG.rope_theta)
+# Precompute RoPE globally to avoid recompiling it
+ROPE_COS, ROPE_SIN = precompute_freqs_cis(CFG.head_dim, CFG.max_seq_len, CFG.rope_base)
+
 
 def _rms_norm_qk(x, scale, eps):
+    """RMS norm for [B, T, heads, head_dim] tensors."""
     x_f32 = x.astype(jnp.float32)
     rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + eps)
     return ((x_f32 / rms) * scale).astype(x.dtype)
 
+
 class GQAttention(nn.Module):
     config: ModelConfig
+
     @nn.compact
     def __call__(self, x, mask=None):
         cfg = self.config
         B, T, C = x.shape
         dtype = cfg.dtype
 
+        # Projections
         q = nn.Dense(cfg.n_heads * cfg.head_dim,    use_bias=False, dtype=dtype, name="q_proj")(x)
         k = nn.Dense(cfg.n_kv_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="k_proj")(x)
         v = nn.Dense(cfg.n_kv_heads * cfg.head_dim, use_bias=False, dtype=dtype, name="v_proj")(x)
 
+        # Reshape to [B, T, heads, head_dim]
         q = q.reshape(B, T, cfg.n_heads,    cfg.head_dim)
         k = k.reshape(B, T, cfg.n_kv_heads, cfg.head_dim)
         v = v.reshape(B, T, cfg.n_kv_heads, cfg.head_dim)
 
+        # QK-Norm
         if cfg.use_qk_norm:
             q_scale = self.param("q_norm_scale", nn.initializers.ones, (cfg.n_heads, cfg.head_dim))
             k_scale = self.param("k_norm_scale", nn.initializers.ones, (cfg.n_kv_heads, cfg.head_dim))
-            q = _rms_norm_qk(q, q_scale, cfg.norm_eps)
-            k = _rms_norm_qk(k, k_scale, cfg.norm_eps)
+            q = _rms_norm_qk(q, q_scale, cfg.norm_eps)  # [B, T, n_heads, head_dim]
+            k = _rms_norm_qk(k, k_scale, cfg.norm_eps)  # [B, T, n_kv_heads, head_dim]
 
-        q_h = q.transpose(0, 2, 1, 3)
+        # RoPE
+        q_h = q.transpose(0, 2, 1, 3)  # [B, n_heads, T, head_dim]
         k_h = k.transpose(0, 2, 1, 3)
         q_h = apply_rope(q_h, ROPE_COS[:T], ROPE_SIN[:T])
         k_h = apply_rope(k_h, ROPE_COS[:T], ROPE_SIN[:T])
-        q = q_h.transpose(0, 2, 1, 3)
+        q = q_h.transpose(0, 2, 1, 3)  # back to [B, T, n_heads, head_dim]
         k = k_h.transpose(0, 2, 1, 3)
 
+        # GQA repeat
         n_rep = cfg.n_heads // cfg.n_kv_heads
         k = jnp.repeat(k, n_rep, axis=2)
         v = jnp.repeat(v, n_rep, axis=2)
 
+        # Flash Attention
         out = jax.nn.dot_product_attention(
             q.astype(jnp.float32),
             k.astype(jnp.float32),
@@ -106,46 +126,51 @@ class GQAttention(nn.Module):
         out = out.reshape(B, T, C)
         return nn.Dense(C, use_bias=False, dtype=dtype, name="o_proj")(out)
 
+
 class SwiGLUFFN(nn.Module):
     config: ModelConfig
+
     @nn.compact
     def __call__(self, x):
         cfg = self.config
         gate = nn.Dense(cfg.ffn_dim, use_bias=False, dtype=cfg.dtype, name="gate_proj")(x)
         up   = nn.Dense(cfg.ffn_dim, use_bias=False, dtype=cfg.dtype, name="up_proj")(x)
-        x    = jax.nn.silu(gate) * up
+        
+        x = jax.nn.silu(gate) * up
         return nn.Dense(cfg.d_model, use_bias=False, dtype=cfg.dtype, name="down_proj")(x)
+
 
 class TransformerBlock(nn.Module):
     config: ModelConfig
+
     @nn.compact
     def __call__(self, x):
         normed = RMSNorm(epsilon=self.config.norm_eps, dtype=self.config.dtype, name="pre_norm")(x)
-        if self.config.parallel_attn_ffn:
-            attn_out = GQAttention(self.config, name="attention")(normed)
-            ffn_out  = SwiGLUFFN(self.config, name="ffn")(normed)
-            x = x + attn_out + ffn_out
-        else:
-            x = x + GQAttention(self.config, name="attention")(normed)
-            x = x + SwiGLUFFN(self.config, name="ffn")(
-                RMSNorm(epsilon=self.config.norm_eps, dtype=self.config.dtype, name="post_attn_norm")(x)
-            )
+        x = x + GQAttention(self.config, name="attention")(normed)
+        x = x + SwiGLUFFN(self.config, name="ffn")(
+            RMSNorm(epsilon=self.config.norm_eps, dtype=self.config.dtype, name="post_attn_norm")(x)
+        )
         return x
+
 
 class Transformer(nn.Module):
     config: ModelConfig
+
     @nn.compact
     def __call__(self, input_ids):
         cfg = self.config
         B, T = input_ids.shape
+
         embed = self.param("token_embed", nn.initializers.normal(stddev=0.02), (cfg.vocab_size, cfg.d_model))
         x = embed[input_ids].astype(cfg.dtype)
 
+        # Scan across layers to save compile time + HBM overhead
         class ScannedBlock(nn.Module):
             config: ModelConfig
             @nn.compact
             def __call__(self, carry, _):
-                out = TransformerBlock(self.config, name="block")(carry)
+                # We use nn.remat to strictly checkpoint the block and prevent CSE
+                out = nn.remat(TransformerBlock, prevent_cse=True)(self.config, name="block")(carry)
                 return out, None
 
         ScanLayers = nn.scan(
@@ -155,12 +180,15 @@ class Transformer(nn.Module):
             split_rngs={'params': False},
             length=cfg.n_layers,
         )
+
         x, _ = ScanLayers(cfg, name="layers")(x, jnp.arange(cfg.n_layers))
         
         x = RMSNorm(epsilon=cfg.norm_eps, dtype=cfg.dtype, name="final_norm")(x)
         logits = (x @ embed.T).astype(jnp.float32)
+
         if cfg.logit_soft_cap > 0:
             logits = cfg.logit_soft_cap * jnp.tanh(logits / cfg.logit_soft_cap)
+
         return logits
 
 
